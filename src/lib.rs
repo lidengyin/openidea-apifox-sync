@@ -1504,7 +1504,7 @@ impl Main {
             req = req.header(name.as_str(), value.as_str());
         }
         req.timeout_ms = Some(60_000);
-        match host::fetch(&req) {
+        match fetch_with_retry(&req) {
             Ok(response) => match apifox::parse_response(response.status, &response.text()) {
                 Ok(out) => {
                     let _ = host::storage::set(&hash_key(&root, &row.path), &fnv1a(&json));
@@ -1703,6 +1703,47 @@ fn ensure_token() -> Result<bool, Error> {
 
 
 
+/// A transport-level failure worth retrying: the host's HTTP client
+/// (reqwest/rustls) can surface a stale keep-alive connection as e.g.
+/// `peer closed connection without sending TLS close_notify`, `connection
+/// reset`, or a timeout. Retrying on a fresh connection normally succeeds.
+fn is_transient_fetch_error(e: &Error) -> bool {
+    let msg = e.to_string().to_ascii_lowercase();
+    [
+        "close_notify",
+        "connection error",
+        "connection reset",
+        "connection closed",
+        "sendrequest",
+        "error sending request",
+        "timed out",
+        "timeout",
+        "unexpected eof",
+        "peer closed",
+    ]
+    .iter()
+    .any(|k| msg.contains(k))
+}
+
+/// `host::fetch` with a small retry for transient connection failures.
+/// No sleep is available to a wasm plugin; discarding a poisoned pooled
+/// connection is enough for the next attempt to open a fresh one.
+fn fetch_with_retry(req: &HttpRequest) -> Result<openidea_plugin::HttpResponse, Error> {
+    let mut last: Option<Error> = None;
+    for _ in 0..3 {
+        match host::fetch(req) {
+            Ok(response) => return Ok(response),
+            Err(e) => {
+                if !is_transient_fetch_error(&e) {
+                    return Err(e);
+                }
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| Error::Failed("fetch failed".into())))
+}
+
 fn call_apifox(call: &apifox::ApiCall, base: &str) -> Result<(u16, String), Error> {
     let url = rewrite_server(&call.url, base);
     let mut req = if call.method == "GET" {
@@ -1714,7 +1755,7 @@ fn call_apifox(call: &apifox::ApiCall, base: &str) -> Result<(u16, String), Erro
         req = req.header(name.as_str(), value.as_str());
     }
     req.timeout_ms = Some(30_000);
-    let response = host::fetch(&req)?;
+    let response = fetch_with_retry(&req)?;
     Ok((response.status, response.text()))
 }
 
@@ -2282,6 +2323,17 @@ mod tests {
     use super::*;
     use openidea_plugin::mock::MockHost;
     use openidea_plugin::HttpResponse;
+
+    #[test]
+    fn transient_fetch_errors_are_detected() {
+        let rustls = Error::Failed("error sending request for url (https://api.apifox.com/v1/projects/2418666/import-openapi): client error (SendRequest): connection error: peer closed connection without sending TLS close_notify".into());
+        assert!(is_transient_fetch_error(&rustls));
+        assert!(is_transient_fetch_error(&Error::Failed("Operation timed out".into())));
+        assert!(is_transient_fetch_error(&Error::Failed("connection reset by peer".into())));
+        // A real API error (HTTP-level) must not be retried.
+        assert!(!is_transient_fetch_error(&Error::Failed("Apifox：invalid token".into())));
+        assert!(!is_transient_fetch_error(&Error::Invalid("bad url".into())));
+    }
 
     fn html_of(report: ImportReport) -> String {
         let main = Main { report: Some(report), ..Default::default() };

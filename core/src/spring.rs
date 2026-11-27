@@ -659,6 +659,37 @@ pub fn unwrap_wrapper(raw: &str) -> String {
     raw.trim().to_string()
 }
 
+/// A single upper-case letter is treated as a Java generic type variable
+/// (`T`, `E`, `K`, `V`, …). `parse_ty` maps these to `Ty::Any` unless a binding
+/// supplied by an enclosing generic wrapper replaces them.
+fn is_type_variable(s: &str) -> bool {
+    let s = s.trim();
+    s.len() == 1 && s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+}
+
+/// Whether a class looks like a response wrapper: it declares a field whose
+/// type is a bare generic variable (e.g. `private T data;`) or inherits from
+/// such a class (e.g. `PaginationMpResponseVO<T> extends DefaultMpResponseVO<T>`).
+/// Walking bases with a depth guard avoids cycles.
+fn has_generic_data_field(cls: &JavaClass, index: &TypeIndex, depth: usize) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if cls.fields.iter().any(|f| is_type_variable(&f.ty)) {
+        return true;
+    }
+    for base in &cls.bases {
+        if let Some(key) = index.key_for(cls, base) {
+            if let Some(base_cls) = index.get(&key) {
+                if has_generic_data_field(base_cls, index, depth + 1) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn base_type(raw: &str) -> String {
     let t = raw.trim();
     let t = t.split('<').next().unwrap_or(t);
@@ -691,18 +722,44 @@ fn is_complex(raw: &str, index: &TypeIndex, ctx: &JavaClass) -> bool {
 
 /// Resolves a Java type expression into the schema model.
 pub fn parse_ty(raw: &str, index: &TypeIndex, ctx: &JavaClass, unwrap: bool) -> Ty {
+    parse_ty_bound(raw, index, ctx, unwrap, &HashMap::new(), &mut Vec::new())
+}
+
+/// Core of `parse_ty` with generic type-variable bindings in scope.
+/// `bindings` maps a bare type variable (`T`) to a concrete type expression
+/// (`MpStlmInfoOutput`) supplied by an enclosing wrapper such as
+/// `DefaultMpResponseVO<MpStlmInfoOutput>`.
+fn parse_ty_bound(
+    raw: &str,
+    index: &TypeIndex,
+    ctx: &JavaClass,
+    unwrap: bool,
+    bindings: &HashMap<String, String>,
+    path: &mut Vec<String>,
+) -> Ty {
     let raw = raw.trim();
     if raw.is_empty() {
         return Ty::Any;
     }
+    // A bare type variable resolves through the enclosing wrapper's binding.
+    if is_type_variable(raw) {
+        if let Some(bound) = bindings.get(raw) {
+            return parse_ty_bound(bound, index, ctx, false, bindings, path);
+        }
+    }
     if unwrap {
-        let inner = unwrap_wrapper(raw);
-        if inner != raw {
-            return parse_ty(&inner, index, ctx, false);
+        let known = WRAPPERS.contains(&base_type(raw).as_str());
+        if known {
+            let inner = unwrap_wrapper(raw);
+            if inner != raw {
+                return parse_ty_bound(&inner, index, ctx, false, bindings, path);
+            }
         }
     }
     if let Some(stripped) = raw.strip_suffix("[]") {
-        return Ty::Array(Box::new(parse_ty(stripped, index, ctx, false)));
+        return Ty::Array(Box::new(parse_ty_bound(
+            stripped, index, ctx, false, bindings, path,
+        )));
     }
     let base = base_type(raw);
     let args = generic_args(raw);
@@ -715,17 +772,17 @@ pub fn parse_ty(raw: &str, index: &TypeIndex, ctx: &JavaClass, unwrap: bool) -> 
         "MultipartFile" | "File" | "Path" | "Resource" | "InputStream" => Ty::Binary,
         "List" | "Set" | "Collection" | "Iterable" | "Queue" | "Deque" | "Stream" | "ArrayList"
         | "LinkedList" | "HashSet" => match args.first() {
-            Some(a) => Ty::Array(Box::new(parse_ty(a, index, ctx, false))),
+            Some(a) => Ty::Array(Box::new(parse_ty_bound(a, index, ctx, false, bindings, path))),
             None => Ty::Array(Box::new(Ty::Any)),
         },
         "Optional" => match args.first() {
-            Some(a) => parse_ty(a, index, ctx, false),
+            Some(a) => parse_ty_bound(a, index, ctx, false, bindings, path),
             None => Ty::Any,
         },
         b if PAGE_TYPES.contains(&b) => {
             let item = args
                 .first()
-                .map(|a| parse_ty(a, index, ctx, false))
+                .map(|a| parse_ty_bound(a, index, ctx, false, bindings, path))
                 .unwrap_or(Ty::Any);
             Ty::Object(vec![
                 Field::new("records", Ty::Array(Box::new(item)), true, "当前页数据"),
@@ -736,11 +793,67 @@ pub fn parse_ty(raw: &str, index: &TypeIndex, ctx: &JavaClass, unwrap: bool) -> 
             ])
         }
         "Map" | "HashMap" | "JSONObject" | "Object" | "T" | "?" => Ty::Any,
-        b if index.resolve(ctx, b).is_some() => Ty::Ref(
-            index.key_for(ctx, b).unwrap_or_else(|| b.to_string()),
-        ),
+        b if index.resolve(ctx, b).is_some() => {
+            // Generic response wrapper (e.g. `DefaultMpResponseVO<T>` with a
+            // `data: T` field): inline it, substituting each type variable with
+            // the corresponding concrete argument so nested DTOs keep their
+            // fields instead of collapsing to `{}`.
+            if !args.is_empty() {
+                if let Some(key) = index.key_for(ctx, b) {
+                    if let Some(cls) = index.get(&key) {
+                        if has_generic_data_field(cls, index, 0) {
+                            let vars = generic_vars_of(cls, index, 0);
+                            let mut bound = bindings.clone();
+                            for (i, var) in vars.iter().enumerate() {
+                                if let Some(arg) = args.get(i) {
+                                    bound.insert(var.clone(), arg.clone());
+                                }
+                            }
+                            // The returned Object carries the concrete DTO as
+                            // a nested `Ty::Ref`, so collect_schemas will pick
+                            // it up from the response type via collect_refs.
+                            let mut sink = Vec::new();
+                            let inline = class_schema_bound(
+                                cls, index, &mut sink, path, &bound,
+                            );
+                            if let Ty::Object(_) = &inline {
+                                return inline;
+                            }
+                        }
+                    }
+                }
+            }
+            Ty::Ref(index.key_for(ctx, b).unwrap_or_else(|| b.to_string()))
+        }
         _ => Ty::Any,
     }
+}
+
+/// Collect the distinct bare type variables used by a class and its bases,
+/// in declaration order (fields first, then inherited ones).
+fn generic_vars_of(cls: &JavaClass, index: &TypeIndex, depth: usize) -> Vec<String> {
+    let mut vars: Vec<String> = Vec::new();
+    if depth > 32 {
+        return vars;
+    }
+    for f in &cls.fields {
+        let t = f.ty.trim();
+        if is_type_variable(t) && !vars.iter().any(|v| v == t) {
+            vars.push(t.to_string());
+        }
+    }
+    for base in &cls.bases {
+        if let Some(key) = index.key_for(cls, base) {
+            if let Some(base_cls) = index.get(&key) {
+                for v in generic_vars_of(base_cls, index, depth + 1) {
+                    if !vars.iter().any(|x| x == &v) {
+                        vars.push(v);
+                    }
+                }
+            }
+        }
+    }
+    vars
 }
 
 fn collect_schemas(endpoints: &[Endpoint], index: &TypeIndex) -> BTreeMap<String, Ty> {
@@ -791,6 +904,18 @@ fn class_schema(
     queue: &mut Vec<String>,
     path: &mut Vec<String>,
 ) -> Ty {
+    class_schema_bound(cls, index, queue, path, &HashMap::new())
+}
+
+/// Like `class_schema`, but resolves field types with generic `bindings` in
+/// scope so a wrapper's `data: T` becomes the concrete response DTO.
+fn class_schema_bound(
+    cls: &JavaClass,
+    index: &TypeIndex,
+    queue: &mut Vec<String>,
+    path: &mut Vec<String>,
+    bindings: &HashMap<String, String>,
+) -> Ty {
     if !cls.enum_values.is_empty() {
         return Ty::Enum(cls.enum_values.clone());
     }
@@ -803,7 +928,9 @@ fn class_schema(
     for base in &cls.bases {
         let Some(key) = index.key_for(cls, base) else { continue };
         let Some(base_cls) = index.get(&key) else { continue };
-        if let Ty::Object(base_fields) = class_schema(base_cls, index, queue, path) {
+        if let Ty::Object(base_fields) =
+            class_schema_bound(base_cls, index, queue, path, bindings)
+        {
             for f in base_fields {
                 if !fields.iter().any(|x| x.name == f.name) {
                     fields.push(f);
@@ -819,7 +946,7 @@ fn class_schema(
         if fields.iter().any(|x| x.name == name) {
             continue;
         }
-        let ty = parse_ty(&f.ty, index, cls, false);
+        let ty = parse_ty_bound(&f.ty, index, cls, false, bindings, path);
         collect_refs(&ty, queue);
         let required = !PRIMITIVE_REQUIRED.contains(&base_type(&f.ty).as_str())
             && f.anns.iter().any(|a| {
